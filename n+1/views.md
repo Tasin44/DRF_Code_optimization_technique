@@ -864,3 +864,106 @@ Order ──(ForeignKey / ১ জন)──▶ User
 * **নেস্টেড রিলেশন থাকলে (One-to-Many এর ভেতর আবার ForeignKey):**  
   বাইরে **`prefetch_related(Prefetch(...))`** আর ভেতরের `queryset`-এ **`select_related(...)`** ব্যবহার করুন।
 * *বিকল্প শর্টকাট:* একই কাজ `.prefetch_related("items__book__author")` দিয়েও করা যায়, তবে সেক্ষেত্রে ৩-৪টি আলাদা কুয়েরি চলে। আর `Prefetch(..., queryset=OrderItem.objects.select_related("book__author"))` ব্যবহার করলে **মাত্র ২টি কুয়েরিতেই** কাজ শেষ হয়—তাই এটি সবচেয়ে বেশি অপটিমাইজড!
+
+
+<br>
+<br>
+
+---
+
+<br>
+<br>
+
+## উদাহরণ ৮ (Advanced): Model `@property` এর ভেতরে লুকানো N+1
+
+<br>
+
+### ❌ আগে
+
+```python
+# models.py
+class Book(models.Model):
+    ...
+    @property
+    def top_reviews(self):
+        return self.reviews.filter(rating__gte=4)     # ❌ প্রতিবার নতুন query
+
+    @property
+    def is_popular(self):
+        return self.reviews.count() > 10              # ❌ আরেকটা query
+
+# serializers.py
+class BookSerializer(serializers.ModelSerializer):
+    is_popular = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = Book
+        fields = ["id", "title", "is_popular"]
+```
+
+> **কী হচ্ছে:** `@property` দেখতে একদম সাধারণ ফিল্ড বা অ্যাট্রিবিউটের মতো (`book.is_popular`)। তাই কোড রিভিউয়ের সময় এর ভেতরে লুকিয়ে থাকা ডাটাবেজ কুয়েরি সহজে চোখে পড়ে না! সিরিয়ালাইজারে `is_popular` পড়লেই প্রতি বইয়ের জন্য আলাদা করে `SELECT COUNT(*) FROM review WHERE book_id = ?` চলতে থাকে (১০০ বইয়ে ১০১ কুয়েরি)।
+
+<br>
+
+### ✅ পরে
+
+```python
+# models.py
+class Book(models.Model):
+    ...
+    @property
+    def is_popular(self):
+        # ✅ ১ম চেক: annotate করা থাকলে সরাসরি সেটাই ব্যবহার করো (সবচেয়ে ফাস্ট)
+        if hasattr(self, "_review_count"):
+            return self._review_count > 10
+        # ✅ ২য় চেক (Fallback): prefetch cache ব্যবহার হবে (len + .all() — .count()/.filter() নয়)
+        return len(self.reviews.all()) > 10
+
+# views.py
+class BookViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = Book.objects.annotate(_review_count=Count("reviews"))
+    serializer_class = BookSerializer
+```
+
+**কী হচ্ছে:** `is_popular` প্রপার্টিটা এখন স্মার্ট! এটি প্রথমে দেখে ভিউ থেকে `annotate` করে মান পাঠানো হয়েছে কি না। পাঠালে ১টি কুয়েরিতেই কাজ শেষ। আর যদি কোনো ভিউতে `annotate` না করে `prefetch_related("reviews")` করা থাকে, তবে `len(self.reviews.all())` ক্যাশ থেকে ডেটা নিয়ে নেয়—কোনো বাড়তি কুয়েরি চলে না!
+
+<br>
+<br>
+
+---
+
+<br>
+
+### 💡 `@property` এর লুকানো N+1 এবং সমাধান — সহজ বাংলায় ব্যাখ্যা (Deep Dive):
+
+#### ১. `@property` কেন বিপজ্জনক (Silent Killer)?
+* সাধারণত `book.title` বা `book.price` দেখলে আমরা ভাবি এটা শুধু মেমোরি থেকে সাধারণ একটা ভ্যালু পড়ছে।
+* কিন্তু `book.is_popular` দেখতে সাধারণ ফিল্ডের মতো হলেও, এর পেছনে `@property` দিয়ে `self.reviews.count()` লেখা আছে—যা গোপনে ডাটাবেজে কুয়েরি পাঠায়!
+* ফলে ডেভেলপার সিরিয়ালাইজারে `fields = ["id", "title", "is_popular"]` লিখে নিশ্চিন্তে বসে থাকেন, আর পেছনে চুপিচুপি ১০০+ কুয়েরি চলতে থাকে!
+
+#### ২. `hasattr(self, "_review_count")` কীভাবে কাজ করছে?
+* **`hasattr(obj, "নাম")`** পাইথনের একটি বিল্ট-ইন ফাংশন, যা চেক করে এই অবজেক্টের ভেতর ওই নামের কোনো অ্যাট্রিবিউট বা ভেরিয়েবল আছে কি না (`True` বা `False` দেয়)।
+* আপনি যখন `BookViewSet`-এ লিখলেন:
+  ```python
+  Book.objects.annotate(_review_count=Count("reviews"))
+  ```
+  তখন ডাটাবেজ প্রতিটি `book` অবজেক্টের গায়ে `_review_count` নামে সংখ্যাটি (যেমন `15`) বসিয়ে দেয়।
+* এরপর যখন `book.is_popular` কল হয়:
+  1. প্রথমে চেক করে: `hasattr(self, "_review_count")` — অর্থাৎ, *"আমার গায়ে কি `annotate` দিয়ে আনা `_review_count` স্টিকার লাগানো আছে?"*
+  2. যদি থাকে (`True`), তাহলে ডাটাবেজে না গিয়ে সরাসরি `15 > 10` চেক করে `True` রিটার্ন করে দেয়! (**০টি বাড়তি কুয়েরি!**)
+
+#### ৩. Fallback হিসেবে `self.reviews.count()` এর বদলে `len(self.reviews.all())` কেন লেখা হলো?
+এটি Django ORM-এর অত্যন্ত গুরুত্বপূর্ণ একটি নিয়ম! ধরুন অন্য কোনো ভিউতে আপনি `annotate` করেননি, বরং `Book.objects.prefetch_related("reviews")` করেছেন:
+* যদি লিখতেন `self.reviews.count()` ➡️ জ্যাঙ্গো prefetch ক্যাশ **ব্যবহার করবে না**, সরাসরি ডাটাবেজে নতুন `COUNT(*)` কুয়েরি চালাবে!
+* যদি লেখেন `len(self.reviews.all())` ➡️ `.all()` সরাসরি মেমোরির **prefetch ক্যাশ** থেকে লিস্টটা নেয় এবং `len()` পাইথনে সেই লিস্টের দৈর্ঘ্য গুনে বলে দেয় (**কোনো নতুন SQL কুয়েরি চলে না**)!
+
+#### 🔑 গোল্ডেন রুল (ক্যাশ বনাম নতুন কুয়েরি):
+
+| যেগুলো Prefetch Cache ব্যবহার করে (✅ ফাস্ট) | যেগুলো সবসময় নতুন SQL Query চালায় (❌ N+1) |
+| :--- | :--- |
+| `.all()` | `.filter(...)` / `.exclude(...)` |
+| `len(obj.relation.all())` | `.count()` |
+| লুপের ভেতর `if obj.relation.all():` | `.exists()` |
+| `list(obj.relation.all())[0]` | `.first()` / `.last()` |
+
+*(সতর্কতা: তবে `prefetch_related` না করে থাকলে `len(self.reviews.all())` সব রো মেমোরিতে লোড করে ফেলবে, তাই লিস্ট ভিউতে সবসময় `annotate` অথবা `prefetch_related` ব্যবহার করতে হবে!)*

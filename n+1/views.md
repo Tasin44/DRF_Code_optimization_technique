@@ -1137,3 +1137,142 @@ Book.objects.annotate(
 **৩. সহজ কথায় `OuterRef("pk")`:**
 * ভেতরের 🟧 কমলা বক্স (`Review`) যখন চলে, তখন সে জিজ্ঞেস করে: *"আমি কোন বইয়ের রিভিউ খুঁজবো?"*
 * তখন `OuterRef("pk")` বাইরের 🟦 নীল বক্সের (`Book`) দিকে আঙুল দেখিয়ে বলে: **"বাইরের বক্সে এখন যে `book`-টা চলছে, তার `id` (`pk`)-টা নাও!"**
+
+
+<br>
+<br>
+
+---
+
+<br>
+<br>
+
+## উদাহরণ ১০ (Advanced): Write side N+1 → `in_bulk` + `bulk_create` / `bulk_update`
+
+<br>
+
+### ❌ আগে
+
+```python
+class OrderCreateSerializer(serializers.Serializer):
+    items = serializers.ListField(child=serializers.DictField())
+
+    def create(self, validated_data):
+        order = Order.objects.create(user=self.context["request"].user)
+        for item in validated_data["items"]:
+            book = Book.objects.get(pk=item["book_id"])          # ❌ প্রতি item এ SELECT
+            OrderItem.objects.create(                            # ❌ প্রতি item এ INSERT
+                order=order, book=book, quantity=item["quantity"]
+            )
+        return order
+```
+
+> **কী হচ্ছে:** একজন ইউজার ২০টি বই একসাথে কার্টে নিয়ে অর্ডার করলে:
+> * মূল অর্ডার তৈরিতে: **১টি** `INSERT` কুয়েরি
+> * লুপে ২০টি বই চেক করতে: **২০টি** `SELECT` কুয়েরি
+> * লুপে ২০টি `OrderItem` সেভ করতে: **২০টি** `INSERT` কুয়েরি
+> * **সর্বমোট: ১ + ২০ + ২০ = ৪১টি কুয়েরি!** (মনে রাখবেন: N+1 শুধু ডেটা পড়ার সময় না, ডেটা সেভ/আপডেট করার সময়ও হয়!)
+
+<br>
+
+### ✅ পরে
+
+```python
+from django.db import transaction
+
+class OrderCreateSerializer(serializers.Serializer):
+    items = serializers.ListField(child=serializers.DictField())
+
+    @transaction.atomic
+    def create(self, validated_data):
+        # ১ নম্বর কুয়েরি: মূল Order তৈরি
+        order = Order.objects.create(user=self.context["request"].user)
+
+        items = validated_data["items"]
+        book_ids = [i["book_id"] for i in items]
+        
+        # ২ নম্বর কুয়েরি: সব বই একবারে এনে ডিকশনারি বানানো -> {1: Book1, 5: Book5, ...}
+        books = Book.objects.in_bulk(book_ids)           # ✅ ১টা SELECT query
+
+        order_items = []
+        for i in items:
+            book = books.get(i["book_id"])               # ✅ মেমোরি (dict) থেকে খোঁজা হচ্ছে
+            if book is None:
+                raise serializers.ValidationError(f"Book {i['book_id']} not found")
+            
+            # ডাটাবেজে সেভ না করে শুধু মেমোরিতে অবজেক্ট বানিয়ে লিস্টে রাখা হচ্ছে
+            order_items.append(
+                OrderItem(order=order, book=book, quantity=i["quantity"])
+            )
+
+        # ৩ নম্বর কুয়েরি: সব আইটেম এক ধাক্কায় ডাটাবেজে সেভ!
+        OrderItem.objects.bulk_create(order_items)       # ✅ ১টা INSERT query
+        return order
+```
+
+**কী হচ্ছে:** ৪১টি কুয়েরি কমে **মাত্র ৩টি কুয়েরিতে** নেমে আসে! (`১টি Order INSERT` + `১টি Book SELECT` + `১টি OrderItem Bulk INSERT`)।
+
+<br>
+<br>
+
+---
+
+<br>
+
+### 💡 Write-side N+1 এবং ৩টি ব্রহ্মাস্ত্র (`in_bulk`, `bulk_create`, `transaction.atomic`) — সহজ বাংলায় ব্যাখ্যা:
+
+#### ১. বাস্তব জীবনের রূপক (দোকানদার ও গোডাউন):
+মনে করুন একজন কাস্টমার **২০টি বইয়ের অর্ডার** দিয়েছে।
+* **❌ আগের পদ্ধতি (বোকা দোকানদার):** দোকানদার ১ম বইয়ের নাম দেখে দৌড়ে গোডাউনে গিয়ে বইটা আনল, খাতায় লিখল। আবার ২য় বইয়ের জন্য দৌড়ে গোডাউনে গেল, খাতায় লিখল... এভাবে ২০ বার দৌড়াদৌড়ি করল!
+* **✅ পরের পদ্ধতি (বুদ্ধিমান দোকানদার):** দোকানদার ২০টি বইয়ের আইডি একটা কাগজে লিখে **১ বারই** গোডাউনে গিয়ে সব বই একসাথে নিয়ে আসল (`in_bulk`)। তারপর টেবিলে বসে সব মিলিয়ে নিয়ে খাতায় **একবারেই** ২০টি এন্ট্রি তুলে ফেলল (`bulk_create`)!
+
+---
+
+#### ২. কোডের ৩টি ম্যাজিক টুল কীভাবে কাজ করে?
+
+##### ক) `Book.objects.in_bulk(book_ids)` কী করে?
+* আপনি যদি `[10, 25, 30]` আইডিগুলোর লিস্ট দেন, `in_bulk()` ডাটাবেজে মাত্র **১টি কুয়েরি** চালায়:
+  ```sql
+  SELECT * FROM book WHERE id IN (10, 25, 30);
+  ```
+* এবং সবচেয়ে মজার ব্যাপার হলো—এটি রেজাল্টটাকে একটি **Python Dictionary** বানিয়ে ফেরত দেয়, যেখানে **Key হলো বইয়ের ID** এবং **Value হলো Book অবজেক্ট**:
+  ```python
+  {
+      10: <Book: Django Mastery>,
+      25: <Book: Python Tricks>,
+      30: <Book: REST APIs>
+  }
+  ```
+* ফলে লুপের ভেতর `books.get(i["book_id"])` লিখলে ডাটাবেজে যেতে হয় না—পাইথন ডিকশনারি থেকে `O(1)` সময়ে নিমেষেই বইটা পেয়ে যায়!
+
+##### খ) `OrderItem(...)` বনাম `OrderItem.objects.create(...)` + `bulk_create()`:
+* লুপের ভেতর আমরা `OrderItem.objects.create(...)` লিখিনি! কারণ `.create()` লিখলেই সাথে সাথে ডাটাবেজে `INSERT` কুয়েরি চলে যায়।
+* তার বদলে আমরা শুধু `OrderItem(...)` লিখে পাইথনের মেমোরিতে অবজেক্ট বানিয়ে `order_items` লিস্টে জমা করেছি (কোনো ডাটাবেজ কল হয়নি)।
+* লুপ শেষ হওয়ার পর **`OrderItem.objects.bulk_create(order_items)`** কল করায় জ্যাঙ্গো মাত্র **১টি SQL কুয়েরিতে** সব রো ঢুকিয়ে দেয়:
+  ```sql
+  INSERT INTO order_item (order_id, book_id, quantity)
+  VALUES (1, 10, 2), (1, 25, 1), (1, 30, 5);
+  ```
+
+##### গ) `@transaction.atomic` কেন খুব জরুরি? (অর্ধেক সেভ হওয়া ঠেকানো)
+* ধরুন কাস্টমার ৫টি বই অর্ডার করেছে। প্রথম `Order` তৈরি হয়ে ডাটাবেজে সেভ হয়ে গেল। কিন্তু ৪ নম্বর বইটি খুঁজতে গিয়ে দেখা গেল ওই আইডির কোনো বই নেই (`ValidationError`)!
+* `@transaction.atomic` **না থাকলে:** আইটেমগুলো সেভ হবে না ঠিকই, কিন্তু ডাটাবেজে একটি **খালি `Order` (অনাথ অর্ডার)** তৈরি হয়ে পড়ে থাকবে!
+* **`@transaction.atomic` থাকলে:** এটি গ্যারান্টি দেয় **"হয় সব কাজ একসাথে সফল হবে (Commit), নাহলে কোনো এরর হলে পুরোটা আগের অবস্থায় ফিরে যাবে (Rollback)!"** ফলে মাঝপথে এরর হলে তৈরি হওয়া `Order`-টাও স্বয়ংক্রিয়ভাবে মুছে যাবে।
+
+---
+
+#### ৩. বোনাস: একসাথে অনেক ডেটা আপডেট করতে হলে কী করব? (`bulk_update`)
+ধরুন ১০০টি বইয়ের দাম ১০% বাড়াতে হবে। লুপের ভেতর `book.save()` চালালে ১০০টি `UPDATE` কুয়েরি চলবে (❌)। তার বদলে ব্যবহার করুন **`bulk_update`**:
+
+```python
+books = list(Book.objects.filter(category_id=5))
+
+for book in books:
+    book.price = book.price * Decimal("1.10")   # মেমোরিতে দাম পরিবর্তন
+
+# ✅ মাত্র ১টি SQL কুয়েরিতে ১০০টি বইয়ের দাম আপডেট হয়ে যাবে!
+Book.objects.bulk_update(books, fields=["price"])
+```
+
+#### ⚠️ ইন্টারভিউয়ের জন্য একটি ছোট্ট সতর্কতা (Gotcha):
+`bulk_create()` এবং `bulk_update()` অনেক ফাস্ট হওয়ার পেছনে একটি ট্রেড-অফ আছে—এগুলো মডেলের কাস্টম **`save()` মেথড** এবং **`pre_save` / `post_save` সিগন্যাল (signals)** কল করে না! তাই সিগন্যালের ওপর নির্ভরশীল কোনো লজিক থাকলে সেটি আলাদাভাবে হ্যান্ডেল করতে হয়।

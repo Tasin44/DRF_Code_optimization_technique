@@ -921,7 +921,7 @@ class Book(models.Model):
 
 # views.py
 class BookViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = Book.objects.annotate(_review_count=Count("reviews"))
+    queryset = Book.objects.annotate(_review_count=Count("reviews"))### prefetch_related or .annotate না করে থাকলে len(self.reviews.all()) সব রো মেমোরিতে লোড করে ফেলবে, তাই লিস্ট ভিউতে সবসময় annotate অথবা prefetch_related ব্যবহার করতে হবে!)
     serializer_class = BookSerializer
 ```
 
@@ -967,3 +967,173 @@ class BookViewSet(viewsets.ReadOnlyModelViewSet):
 | `list(obj.relation.all())[0]` | `.first()` / `.last()` |
 
 *(সতর্কতা: তবে `prefetch_related` না করে থাকলে `len(self.reviews.all())` সব রো মেমোরিতে লোড করে ফেলবে, তাই লিস্ট ভিউতে সবসময় `annotate` অথবা `prefetch_related` ব্যবহার করতে হবে!)*
+
+
+<br>
+<br>
+
+---
+
+<br>
+<br>
+
+## উদাহরণ ৯ (Advanced): প্রতি বইয়ের সর্বশেষ review → `Subquery` + `OuterRef`
+
+<br>
+
+### ❌ আগে
+
+```python
+class BookSerializer(serializers.ModelSerializer):
+    latest_review_rating = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Book
+        fields = ["id", "title", "latest_review_rating"]
+
+    def get_latest_review_rating(self, obj):
+        r = obj.reviews.order_by("-created_at").first()    # ❌ প্রতি বইয়ে ১ query
+        return r.rating if r else None
+```
+
+> **কী হচ্ছে:** `.order_by("-created_at").first()` কখনোই prefetch cache ব্যবহার করে না। তাই ১০০টি বই থাকলে: ১টি মূল কুয়েরি + ১০০টি বইয়ের সর্বশেষ রিভিউ আনতে ১০০টি কুয়েরি = **১০১টি কুয়েরি (1 + N)**।
+
+<br>
+
+### ✅ পরে
+
+```python
+from django.db.models import Subquery, OuterRef
+
+# ১. ভেতরের ছোট্ট কুয়েরি (Subquery) তৈরি করা
+latest = Review.objects.filter(book=OuterRef("pk")).order_by("-created_at")
+
+class BookSerializer(serializers.ModelSerializer):
+    latest_review_rating = serializers.IntegerField(read_only=True)  # ✅ সাধারণ ফিল্ড
+
+    class Meta:
+        model = Book
+        fields = ["id", "title", "latest_review_rating"]
+
+class BookViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = Book.objects.annotate(
+        latest_review_rating=Subquery(latest.values("rating")[:1])
+    )
+    serializer_class = BookSerializer
+```
+
+**কী হচ্ছে:** ডাটাবেজ নিজেই একটি মাত্র SQL কুয়েরির ভেতরে প্রতিটা বইয়ের জন্য একটি ছোট কুয়েরি (Correlated Subquery) চালিয়ে সর্বশেষ `rating` বের করে বইয়ের গায়ে লাগিয়ে দেয়। **১০১ কুয়েরি → মাত্র ১টি কুয়েরি!**
+
+<br>
+<br>
+
+---
+
+<br>
+
+### 💡 `Subquery` এবং `OuterRef` কীভাবে কাজ করে? (একদম সহজ ব্যাখ্যা — Deep Dive)
+
+অনেকেই `Subquery` আর `OuterRef` দেখে ভয় পায়, কিন্তু কনসেপ্টটা আসলে খুবই সহজ! চলুন ভেঙে ভেঙে বুঝি:
+
+#### ১. এখানে কেন `annotate(Count/Avg)` দিয়ে কাজ হলো না?
+* উদাহরণ ৬-এ আমাদের দরকার ছিল **মোট সংখ্যা (`Count`)** বা **গড় (`Avg`)** — এগুলো সাধারণ অ্যাগ্রিগেট ফাংশন।
+* কিন্তু এখন আমাদের দরকার: **"প্রতিটি বইয়ের সর্বশেষ (latest) ১টি রিভিউয়ের `rating` কত?"** — অর্থাৎ সময় অনুযায়ী সাজিয়ে (`order_by("-created_at")`) একদম প্রথম ১টি রেকর্ড (`[:1]`) তুলে আনা।
+* এই ধরনের **"প্রতি গ্রুপের প্রথম / শেষ / সর্বোচ্চ / সর্বনিম্ন ১টি রেকর্ড"** বের করার কাজ সাধারণ `Count`/`Avg` দিয়ে করা যায় না। এর জন্যই লাগে **`Subquery` + `OuterRef`**!
+
+#### ২. প্রতিটি অংশের সহজ অর্থ:
+
+কোডটার ৪টি টুকরো আলাদা করে দেখুন:
+
+```python
+latest = Review.objects.filter(book=OuterRef("pk")).order_by("-created_at")
+#                              ▲                    ▲
+#                              │                    └── ২. নতুন থেকে পুরোনো সাজাও
+#                              └── ১. বাইরের বইয়ের ID-র সাথে মেলাও
+
+Book.objects.annotate(
+    latest_review_rating=Subquery(latest.values("rating")[:1])
+    #                    ▲               ▲                ▲
+    #                    │               │                └── ৪. শুধু প্রথম ১টা নাও (LIMIT 1)
+    #                    │               └── ৩. শুধু rating কলামটাই আনো
+    #                    └── ৫. এটাকে বড় কুয়েরির ভেতর বসিয়ে দাও
+)
+```
+
+1. **`OuterRef("pk")` (বাইরের কুয়েরির দিকে আঙুল দেখানো):**
+   * এখানে বাইরের বড় কুয়েরিটা চলছে **`Book`** টেবিলের ওপর।- explained below
+   * ভেতরের ছোট কুয়েরিটা চলছে **`Review`** টেবিলের ওপর।- explained below
+   * এখন ভেতরের `Review` কুয়েরিটা কীভাবে বুঝবে সে **কোন বইয়ের** রিভিউ খুঁজবে?
+   * **`OuterRef("pk")`** মানে হলো: *"বাইরের (Outer) কুয়েরিতে বর্তমানে যে `Book`-টা চলছে, তার `pk` (id)-টা এখানে বসাও!"*
+
+2. **`.order_by("-created_at")`:**
+   * ওই বইয়ের সব রিভিউকে **নতুন থেকে পুরোনো** (descending) ক্রমে সাজায়, যাতে সর্বশেষ রিভিউটা সবার ওপরে থাকে।
+
+3. **`.values("rating")[:1]` (খুবই জরুরি ২টি নিয়ম!):**
+   * **`values("rating")`:** `Subquery` কখনোই পুরো `Review` অবজেক্ট (সব কলাম) রিটার্ন করতে পারে না—এটি কেবল **১টি মাত্র কলাম** রিটার্ন করতে পারে! তাই শুধু `"rating"` কলামটা বেছে নেওয়া হয়েছে।
+   * **`[:1]`:** `Subquery` কেবল **১টি মাত্র রো (row)** রিটার্ন করতে পারে (SQL-এ `LIMIT 1`)। যদি `[:1]` না দেন আর একাধিক রিভিউ থাকে, তবে ডাটাবেজ এরর (`more than one row returned by a subquery`) দেবে!
+
+4. **`Subquery(...)`:**
+   * এটি জ্যাঙ্গোকে বলে: *"এই ছোট্ট কুয়েরিটা আলাদা করে চালিও না, বরং বাইরের `Book` কুয়েরিটার ভেতরেই ঢুকিয়ে দিয়ে একসাথে চালাও!"*
+
+#### ৩. ডাটাবেজে আসল SQL কুয়েরিটা কেমন দেখায়?
+```sql
+SELECT book.*,
+       (
+           SELECT review.rating
+           FROM review
+           WHERE review.book_id = book.id      -- <--- এটাই OuterRef("pk")!
+           ORDER BY review.created_at DESC
+           LIMIT 1                             -- <--- এটাই [:1]!
+       ) AS latest_review_rating
+FROM book;
+```
+দেখুন! একটা বড় `SELECT` কুয়েরির ভেতরেই আরেকটা ছোট `SELECT` কুয়েরি বসে গেছে। তাই অ্যাপ্লিকেশন থেকে ডাটাবেজে মাত্র **১টি কুয়েরি** যায়, আর প্রতিটা বইয়ের গায়ে `latest_review_rating` (যেমন `5` বা `None`) বসে চলে আসে!
+
+#### 🔑 কখন এই প্যাটার্ন ব্যবহার করবেন?
+যখনই এমন কোনো চাহিদা আসবে:
+* প্রতিটি বইয়ের **সর্বশেষ (latest) রিভিউয়ের** রেটিং/কমেন্ট
+* প্রতিটি ইউজারের **সর্বশেষ অর্ডারের** তারিখ বা টাকার পরিমাণ
+* প্রতিটি ক্যাটাগরির **সবচেয়ে দামি (highest price)** বইয়ের নাম
+
+অর্থাৎ **"প্রতিটি প্যারেন্টের জন্য চাইল্ডের প্রথম/শেষ/সর্বোচ্চ ১টি নির্দিষ্ট ফিল্ড"** চাইলে চোখ বন্ধ করে **`annotate` + `Subquery` + `OuterRef`** ব্যবহার করবেন!
+
+
+<br>
+
+#### 🔍 কোনটা বাইরের বড় কুয়েরি (Outer Query) আর কোনটা ভেতরের ছোট কুয়েরি (Subquery)?
+
+**১. পাইথন (Django) কোডে দেখুন (একটার ভেতর আরেকটা):**
+```python
+# 🟦 বাইরের বড় কুয়েরি (Outer Query) → চলছে Book টেবিলের ওপর
+Book.objects.annotate(
+    latest_review_rating=Subquery(
+        # 🟧 ভেতরের ছোট কুয়েরি (Inner / Sub Query) → চলছে Review টেবিলের ওপর
+        Review.objects.filter(book=OuterRef("pk")).order_by("-created_at").values("rating")[:1]
+    )
+)
+```
+
+**২. SQL-এ বক্সের ভেতর বক্স দিয়ে দেখুন:**
+```sql
+┌────────────────────────────────────────────────────────┐
+│ 🟦 বাইরের বড় কুয়েরি (Outer Query - Book টেবিল)          │
+│                                                        │
+│ SELECT book.*,                                         │
+│     (                                                  │
+│       ┌──────────────────────────────────────────────┐ │
+│       │ 🟧 ভেতরের ছোট কুয়েরি (Subquery - Review টেবিল) │ │
+│       │                                              │ │
+│       │ SELECT review.rating                         │ │
+│       │ FROM review                                  │ │
+│       │ WHERE review.book_id = book.id  ◀── OuterRef │ │
+│       │ ORDER BY review.created_at DESC              │ │
+│       │ LIMIT 1                                      │ │
+│       └──────────────────────────────────────────────┘ │
+│     ) AS latest_review_rating                          │
+│ FROM book;                                             │
+└────────────────────────────────────────────────────────┘
+```
+
+**৩. সহজ কথায় `OuterRef("pk")`:**
+* ভেতরের 🟧 কমলা বক্স (`Review`) যখন চলে, তখন সে জিজ্ঞেস করে: *"আমি কোন বইয়ের রিভিউ খুঁজবো?"*
+* তখন `OuterRef("pk")` বাইরের 🟦 নীল বক্সের (`Book`) দিকে আঙুল দেখিয়ে বলে: **"বাইরের বক্সে এখন যে `book`-টা চলছে, তার `id` (`pk`)-টা নাও!"**

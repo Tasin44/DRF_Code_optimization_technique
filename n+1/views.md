@@ -742,3 +742,125 @@ Django ORM-এ `Count` এবং `Avg` হলো **অ্যাগ্রিগ�
 * **১টা অবজেক্ট লাগলে** ➡️ `select_related`
 * **অনেকগুলো অবজেক্টের লিস্ট লাগলে** ➡️ `prefetch_related`
 * **অবজেক্ট না, শুধু হিসাব (Count / Avg / Sum / Max / Min) লাগলে** ➡️ `annotate`
+
+
+<br>
+<br>
+
+---
+
+<br>
+<br>
+
+## উদাহরণ ৭ (Advanced): নেস্টেড serializer (`Order` → `items` → `book` → `author`)
+
+<br>
+
+### ❌ আগে
+
+```python
+class OrderItemSerializer(serializers.ModelSerializer):
+    book_title = serializers.CharField(source="book.title")
+    author = serializers.CharField(source="book.author.name")
+
+    class Meta:
+        model = OrderItem
+        fields = ["book_title", "author", "quantity"]
+
+class OrderSerializer(serializers.ModelSerializer):
+    items = OrderItemSerializer(many=True)
+    user_email = serializers.CharField(source="user.email")
+
+    class Meta:
+        model = Order
+        fields = ["id", "user_email", "items"]
+
+class OrderViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = Order.objects.all()    # ❌ user, items, book, author সব N+1
+    serializer_class = OrderSerializer
+```
+
+> **কী হচ্ছে:** ২০টি অর্ডার এবং প্রতিটিতে ৫টি করে আইটেম থাকলে (মোট ১০০টি আইটেম):
+> * মূল অর্ডার আনতে: **১টি** কুয়েরি (`SELECT * FROM order`)
+> * প্রতি অর্ডারের `user_email` আনতে: **২০টি** কুয়েরি
+> * প্রতি অর্ডারের `items` আনতে: **২০টি** কুয়েরি
+> * ১০০টি আইটেমের প্রতিটির জন্য `book` আনতে: **১০০টি** কুয়েরি
+> * ১০০টি বইয়ের প্রতিটির `author` আনতে: **১০০টি** কুয়েরি
+> * **সর্বমোট: ১ + ২০ + ২০ + ১০০ + ১০০ = ২৪১টি কুয়েরি!** (ভয়াবহ নেস্টেড N+1 বিস্ফোরণ)।
+
+<br>
+
+### ✅ পরে
+
+```python
+from django.db.models import Prefetch
+
+class OrderViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = (
+        Order.objects
+        .select_related("user")                       # Order → User (FK)
+        .prefetch_related(
+            Prefetch(
+                "items",
+                queryset=OrderItem.objects.select_related("book__author"),  # ✅ ভেতরে JOIN
+            )
+        )
+    )
+    serializer_class = OrderSerializer
+```
+
+**কী হচ্ছে:** ২৪১টি কুয়েরি কমে মাত্র **২টি SQL কুয়েরিতে** নেমে আসে!
+
+<br>
+<br>
+
+---
+
+<br>
+
+### 💡 নেস্টেড সিরিয়ালাইজার অপটিমাইজেশন — সহজ বাংলায় ব্যাখ্যা (Deep Dive):
+
+এটি রিয়েল-ওয়ার্ল্ড ই-কমার্স প্রজেক্টে সবচেয়ে বেশি দেখা যায়! চলুন ধাপে ধাপে রাস্তাটা (Relationship Chain) বুঝি:
+
+```text
+Order ──(ForeignKey / ১ জন)──▶ User
+  │
+  └──(One-to-Many / অনেকগুলো)──▶ OrderItem ──(FK / ১টা)──▶ Book ──(FK / ১ জন)──▶ Author
+```
+
+#### ১. প্রথম ধাপ: `Order` থেকে `User` (১ নম্বর কুয়েরি)
+* ১টি অর্ডার করেন মাত্র **১ জন ইউজার** (`ForeignKey`)।
+* তাই সরাসরি **`.select_related("user")`** ব্যবহার করা হলো।
+* এর ফলে প্রথম কুয়েরিতেই `Order` আর `User` টেবিল `JOIN` হয়ে একবারে চলে আসে:
+  ```sql
+  -- ১ নম্বর কুয়েরি: সব Order + তাদের User একসাথে
+  SELECT order.*, user.*
+  FROM order
+  INNER JOIN user ON order.user_id = user.id;
+  ```
+
+#### ২. দ্বিতীয় ধাপ: `Order` থেকে `items` → `book` → `author` (২ নম্বর কুয়েরি)
+* ১টি অর্ডারে **একাধিক আইটেম** থাকে (`One-to-Many`), তাই এখানে `select_related` চলবে না—লাগবে **`prefetch_related`**।
+* **ম্যাজিক ট্রিক (`Prefetch` এর ভেতর `select_related`):**  
+  আমরা যদি শুধু `prefetch_related("items")` লিখতাম, তবে `items` আসতো ঠিকই, কিন্তু প্রতিটি আইটেমের ভেতর গিয়ে `book` আর `author` আনতে গিয়ে আবার ۲۰۰টি কুয়েরি হতো!
+* তাই আমরা **`Prefetch("items", queryset=OrderItem.objects.select_related("book__author"))`** লিখে জ্যাঙ্গোকে বলে দিলাম:
+  > *"ভাই জ্যাঙ্গো! তুমি যখন `OrderItem` গুলো আনতে ডাটাবেজে যাবে, তখন খালি `OrderItem` এনো না—ওই একই কুয়েরির ভেতর `book` আর `author`-কেও `JOIN` করে একসাথে নিয়ে এসো!"*
+* এর ফলে ২য় কুয়েরিটি চলে ঠিক এভাবে:
+  ```sql
+  -- ২ নম্বর কুয়েরি: সব OrderItem + তাদের Book + Author একসাথে JOIN হয়ে আসে!
+  SELECT order_item.*, book.*, author.*
+  FROM order_item
+  INNER JOIN book ON order_item.book_id = book.id
+  INNER JOIN author ON book.author_id = author.id
+  WHERE order_item.order_id IN (1, 2, 3, ..., 20);
+  ```
+
+#### ৩. লক্ষ্য করুন: এখানে কেন `to_attr` লাগেনি?
+* উদাহরণ ৫-এ আমরা `.filter(is_approved=True)` করে আংশিক ডেটা এনেছিলাম, তাই আলাদা নাম (`to_attr`) দিতে হয়েছিল।
+* কিন্তু এখানে আমরা অর্ডারের **সবগুলো `items`**-ই আনছি, শুধু তাদের সাথে `book__author` জুড়ে দিচ্ছি।
+* তাই `to_attr` না দিলে জ্যাঙ্গো ডিফল্টভাবে `order.items.all()` ক্যাশেই সাজিয়ে রাখে, আর `OrderSerializer`-এর `items = OrderItemSerializer(many=True)` সরাসরি ওই ক্যাশ থেকেই সব ডেটা পড়ে নেয়!
+
+#### 🔑 এক নজরে মনে রাখার কৌশল:
+* **নেস্টেড রিলেশন থাকলে (One-to-Many এর ভেতর আবার ForeignKey):**  
+  বাইরে **`prefetch_related(Prefetch(...))`** আর ভেতরের `queryset`-এ **`select_related(...)`** ব্যবহার করুন।
+* *বিকল্প শর্টকাট:* একই কাজ `.prefetch_related("items__book__author")` দিয়েও করা যায়, তবে সেক্ষেত্রে ৩-৪টি আলাদা কুয়েরি চলে। আর `Prefetch(..., queryset=OrderItem.objects.select_related("book__author"))` ব্যবহার করলে **মাত্র ২টি কুয়েরিতেই** কাজ শেষ হয়—তাই এটি সবচেয়ে বেশি অপটিমাইজড!

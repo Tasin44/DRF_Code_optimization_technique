@@ -213,6 +213,96 @@ class ReviewViewSet(viewsets.ReadOnlyModelViewSet):
 <br>
 <br>
 
+## উদাহরণ ২.৫ (Medium — Unique): কাস্টম Metadata সহ Pagination (`get_paginated_response` ওভাররাইড)
+
+রিয়েল-ওয়ার্ল্ড ফ্রন্টএন্ড (React / Next.js / Flutter) ডেভেলপাররা প্রায়ই DRF-এর ডিফল্ট রেসপন্স (`count`, `next`, `previous`, `results`) পছন্দ করে না! কারণ ওখানে **`total_pages` (মোট কয়টি পেজ আছে)** বা **`current_page` (আমি এখন কত নম্বর পেজে আছি)** সরাসরি দেওয়া থাকে না!
+
+<br>
+
+### ❌ আগে (ডিফল্ট রেসপন্সের সীমাবদ্ধতা)
+
+```json
+{
+    "count": 95,
+    "next": "http://api.site.com/books/?page=3",
+    "previous": "http://api.site.com/books/?page=1",
+    "results": [...]
+}
+```
+> **সমস্যা কী?** ফ্রন্টএন্ডে পেজিনেশন বার (`< 1 2 [3] 4 5 >`) দেখাতে গেলে ফ্রন্টএন্ড ডেভেলপারকে নিজেই `Math.ceil(count / page_size)` করে মোট পেজ বের করতে হয়, আবার URL পার্স করে বর্তমান পেজ নম্বর বের করতে হয়।
+
+<br>
+
+### ✅ পরে (কাস্টম Metadata সহ ক্লিন Pagination)
+
+```python
+# pagination.py
+from rest_framework.pagination import PageNumberPagination
+from rest_framework.response import Response
+
+class CustomMetaPagination(PageNumberPagination):
+    page_size = 20
+    page_size_query_param = "page_size"
+    max_page_size = 100
+
+    def get_paginated_response(self, data):
+        return Response({
+            "meta": {
+                "total_items": self.page.paginator.count,      # মোট আইটেম (যেমন: 95)
+                "total_pages": self.page.paginator.num_pages,  # মোট পেজ (যেমন: 5)
+                "current_page": self.page.number,              # বর্তমান পেজ (যেমন: 2)
+                "page_size": self.get_page_size(self.request), # প্রতি পেজে কয়টি (যেমন: 20)
+                "has_next": self.page.has_next(),              # পরের পেজ আছে কি না (True/False)
+                "has_previous": self.page.has_previous(),      # আগের পেজ আছে কি না (True/False)
+            },
+            "links": {
+                "next": self.get_next_link(),
+                "previous": self.get_previous_link(),
+            },
+            "results": data,
+        })
+
+# views.py
+class BookViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = Book.objects.select_related("author").order_by("id")
+    serializer_class = BookSerializer
+    pagination_class = CustomMetaPagination
+```
+
+**এখন JSON রেসপন্স কেমন আসবে?**
+```json
+{
+    "meta": {
+        "total_items": 95,
+        "total_pages": 5,
+        "current_page": 2,
+        "page_size": 20,
+        "has_next": true,
+        "has_previous": true
+    },
+    "links": {
+        "next": "http://127.0.0.1:8000/api/books/?page=3",
+        "previous": "http://127.0.0.1:8000/api/books/?page=1"
+    },
+    "results": [...]
+}
+```
+
+<br>
+
+#### 💡 সহজ বাংলায় ব্যাখ্যা:
+1. **`get_paginated_response(self, data)`:** DRF-এ এটিই সেই মেথড যা ফাইনাল JSON স্ট্রাকচার তৈরি করে। এটিকে ওভাররাইড করে আপনি নিজের কোম্পানির স্ট্যান্ডার্ড অনুযায়ী যেকোনো সুন্দর ফরম্যাট বানাতে পারেন।
+2. **কোনো বাড়তি কুয়েরি চলে না!** `self.page.paginator.num_pages`, `self.page.number`, `has_next()` — এগুলো সব আগেই আনা `count` থেকে পাইথনেই হিসাব হয়, ডাটাবেজে কোনো নতুন কুয়েরি যায় না।
+3. **কখন ব্যবহার করবেন?** যখন ফ্রন্টএন্ডে নম্বরওয়ালা পেজিনেশন বার (`1, 2, 3, ..., 10`) বা *"Showing page 2 of 5"* দেখাতে হবে—প্রায় সব প্রোডাকশন প্রজেক্টেই এই প্যাটার্ন ব্যবহার করা হয়!
+
+<br>
+<br>
+
+---
+
+<br>
+<br>
+
 # 🔴 HARD
 
 ## উদাহরণ ৩ (Hard): কাস্টম `NoCount` Pagination (`limit + 1` কৌশল)
@@ -238,6 +328,17 @@ class BookListView(APIView):
 > **কী হচ্ছে (ভয়াবহ অপচয় ও বাগ):**
 > 1. `list(Book.objects...)` লেখার কারণে ১ লক্ষ বই ডাটাবেজ থেকে টেনে এনে RAM-এ ১ লক্ষ পাইথন অবজেক্ট বানানো হচ্ছে—তারপর মাত্র ২০টা রেখে বাকি ৯৯,৯৮০টা ফেলে দেওয়া হচ্ছে!
 > 2. কোনো Input Validation নেই: কেউ `?page=abc` দিলে সার্ভার `500 Internal Server Error` দিয়ে ক্র্যাশ করবে, আর `?page=-5` দিলে পাইথনের নেগেটিভ স্লাইসিং হয়ে উল্টাপাল্টা ডেটা চলে আসবে!
+
+<br>
+
+#### ❓ `data = books[(page - 1) * size : page * size]` লাইনটিতে কী হচ্ছে?
+এটি হলো পাইথনের **List Slicing (`books[start : end]`)**, যা `books` লিস্ট থেকে নির্দিষ্ট পেজের ২০টি বই কেটে আলাদা করে (`size = 20` ধরে):
+* **`page = 1`** → `books[(1-1)*20 : 1*20]` → **`books[0 : 20]`** (প্রথম ২০টি বই)
+* **`page = 2`** → `books[(2-1)*20 : 2*20]` → **`books[20 : 40]`** (পরের ২০টি বই)
+* **`page = 3`** → `books[(3-1)*20 : 3*20]` → **`books[40 : 60]`**
+
+**এখানে ❌ (খারাপ) কেন?**  
+অঙ্কটা ঠিক আছে, কিন্তু আগের লাইনে `list(...)` করার ফলে পুরো ১ লক্ষ বই আগে **RAM-এ লোড** হয়ে গেছে, তারপর পাইথনে বসে ২০টা কেটে নিয়ে বাকি ৯৯,৯৮০টা ফেলে দেওয়া হচ্ছে! *(অথচ `list()` না করে সরাসরি **QuerySet**-এ স্লাইস করলে জ্যাঙ্গো ডাটাবেজে `LIMIT 20 OFFSET 20` চালাত!)*
 
 <br>
 

@@ -67,6 +67,50 @@ REST_FRAMEWORK = {
    আপনি যেহেতু `page_size_query_param = "page_size"` চালু করেছেন, কোনো হ্যাকার বা দুষ্ট ইউজার যদি URL-এ `?page_size=1000000` (১০ লক্ষ) লিখে রিকোয়েস্ট পাঠায়, তাহলে আপনার সার্ভার ডাউন (DoS Attack) হয়ে যেতে পারে! `max_page_size = 100` দিলে কেউ ১০ লক্ষ চাইলেও সার্ভার সর্বোচ্চ ১০০টির বেশি দেবে না।
 
 <br>
+
+#### ❓ কোডের ভেতরে আসলে কী ঘটছে এবং Response দেখতে কেমন হবে?
+
+* **`queryset = Book.objects.select_related("author")`:** বইয়ের সাথে লেখকের নাম (`author_name`) আনতে ১টি SQL `JOIN` চালায় (যাতে N+1 সমস্যা না হয়)।
+* **`serializer_class = BookSerializer`:** ডাটাবেজের পাইথন অবজেক্টগুলোকে JSON ফরম্যাটে রূপান্তর করে।
+* **`pagination_class`:** ১ লক্ষ বই একসাথে না পাঠিয়ে মাত্র ২০টি করে ভাগ করে পাঠায়।
+
+**❌ Pagination ছাড়া Response (বিশাল লিস্ট — ১ লক্ষ বই একসাথে):**
+```json
+[
+    {
+        "id": 1,
+        "title": "Django Guide",
+        "author_name": "Rahim"
+    },
+    {
+        "id": 2,
+        "title": "Python Mastery",
+        "author_name": "Karim"
+    }
+    // ... এভাবে ১ লক্ষ বই একসাথে চলে আসবে!
+]
+```
+
+**✅ `PageNumberPagination` সহ Response (মাত্র ২০টি বই):**
+```json
+{
+    "count": 100000,
+    "next": "http://127.0.0.1:8000/api/books/?page=2",
+    "previous": null,
+    "results": [
+        {
+            "id": 1,
+            "title": "Django Guide",
+            "author_name": "Rahim"
+        }
+        // ... মাত্র ২০টি বই!
+    ]
+}
+```
+
+> **সংক্ষেপে:** `select_related("author")` ঠেকায় **N+1 সমস্যা**, আর `pagination_class` ঠেকায় **বিশাল ডেটা লোড**। দুটো একসাথে ব্যবহার করলে API হয় **ডাবল ফাস্ট**! 🚀
+
+<br>
 <br>
 
 ---

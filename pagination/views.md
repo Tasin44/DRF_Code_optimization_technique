@@ -198,6 +198,14 @@ class ReviewViewSet(viewsets.ReadOnlyModelViewSet):
 > ⚠️ **সীমাবদ্ধতা (Trade-off):** এখানে সরাসরি "পেজ ৫-এ যাও" বা "পেজ ৫০-এ যাও" (Random Page Jump) করা যায় না। শুধু **Next / Previous** যাওয়া যায়। তাই **Facebook/Instagram Feed, Infinite Scroll, Chat History**-এর জন্য এটাই সেরা।
 
 <br>
+
+#### ❓ `cursor_query_param = "cursor"` এর মানে কী?
+এর মানে হলো **URL-এর কোয়েরি প্যারামিটারের নাম কী হবে তা ঠিক করে দেওয়া**।
+* `cursor_query_param = "cursor"` দিলে URL হবে: `/api/reviews/?cursor=cD0yMDI2LTEx...`
+* আর যদি বদলে `cursor_query_param = "c"` (বা `"next_token"`) দেন, তবে URL হবে: `/api/reviews/?c=cD0yMDI2LTEx...`
+* *(নোট: DRF-এ এটির ডিফল্ট মান এমনিতেই `"cursor"` থাকে, তাই না লিখলেও কাজ করে; তবে কাস্টম নাম দিতে চাইলে এটি ব্যবহার করা হয়।)*
+
+<br>
 <br>
 
 ---

@@ -419,6 +419,46 @@ class BookViewSet(viewsets.ReadOnlyModelViewSet):
 যখন UI-তে মোট সংখ্যা (যেমন *"Total 5,42,100 results"*) দেখানোর দরকার নেই—শুধু **"Next"** বা **"Load More"** বাটন দেখাতে হবে এবং টেবিলটি অনেক বড়।
 
 <br>
+
+#### 🔍 `NoCountPagination` ক্লাসের লাইন-বাই-লাইন সহজ ব্যাখ্যা:
+
+1. **ক্লাস সেটআপ (`BasePagination`, `default_size`, `max_size`):**
+   * `class NoCountPagination(BasePagination):` — DRF-এর একদম বেস ক্লাস থেকে নিজের কাস্টম পেজিনেশন বানাচ্ছি।
+   * `default_size = 20`, `max_size = 100` — ইউজার কিছু না বললে ২০টি, আর বেশি চাইলেও সর্বোচ্চ ১০০টির বেশি দেব না।
+
+2. **ইনপুট নিরাপদ করার হেল্পার ফাংশন (`_int`):**
+   ```python
+   def _int(self, value, default):
+       try:
+           v = int(value)
+           return v if v > 0 else default
+       except (TypeError, ValueError):
+           return default
+   ```
+   * URL থেকে আসা মান (`value`) সবসময় স্ট্রিং হয় (যেমন `"2"`, `"abc"`, `"-5"` বা `None`)।
+   * এটি মানটিকে পূর্ণসংখ্যা (`int`) বানায়। যদি শূন্য বা মাইনাস (`-5`) হয়, অথবা `"abc"` / `None` হওয়ায় এরর খায়—তাহলে সার্ভার ক্র্যাশ না করে চুপচাপ `default` মান ফেরত দেয়!
+
+3. **`paginate_queryset()` — আসল কাজ এখানেই হয়:**
+   * `self.size = min(self._int(request.query_params.get("page_size"), self.default_size), self.max_size)`  
+     👉 URL থেকে `page_size` নেয় (না দিলে ২০), তারপর `min(..., 100)` দিয়ে নিশ্চিত করে যেন ১০০-এর বেশি না হয়।
+   * `self.page = self._int(request.query_params.get("page"), 1)`  
+     👉 URL থেকে `page` নম্বর নেয়, না দিলে বা ভুল দিলে `1` ধরে নেয়।
+   * `offset = (self.page - 1) * self.size`  
+     👉 শুরু থেকে কয়টা রো বাদ দেবে (Skip করবে) তা বের করে। যেমন পেজ ২ আর সাইজ ২০ হলে: `(2 - 1) * 20 = 20`।
+   * `rows = list(queryset[offset : offset + self.size + 1])`  
+     👉 **আসল ম্যাজিক!** সরাসরি QuerySet-এ স্লাইস করায় জ্যাঙ্গো ডাটাবেজে `LIMIT 21 OFFSET 20` চালায় (সব ডেটা RAM-এ আনে না, শুধু ২১টা আনে!)।
+   * `if not rows and self.page > 1: raise NotFound("Page out of range")`  
+     👉 ধরুন মোট পেজ আছে ৫টা, কিন্তু ইউজার দিল `?page=99`। তখন `rows` খালি হবে এবং `page > 1`, তাই `404 Not Found` দেখাবে! *(তবে পেজ ১ খালি হলে—অর্থাৎ টেবিলে কোনো বই-ই না থাকলে—৪০৪ না দিয়ে খালি লিস্ট `[]` দেবে!)*
+   * `self.has_next = len(rows) > self.size`  
+     👉 যদি ২১টি রো আসে (`21 > 20`), তবে `True` (পরের পেজ আছে)। ২০টি বা কম এলে `False` (এটাই শেষ পেজ)।
+   * `return rows[: self.size]`  
+     👉 বাড়তি ২১ নম্বর রো-টা কেটে ফেলে শুধু প্রথম ২০টি রো সিরিয়ালাইজারের কাছে পাঠায়।
+
+4. **`get_paginated_response(self, data)` — ফাইনাল JSON বানানো:**
+   * সিরিয়ালাইজার ওই ২০টি রো-কে JSON (`data`) বানিয়ে এই মেথডে দেয়।
+   * এটি `page`, `page_size`, `has_next`, `has_previous` (`page > 1` হলেই আগের পেজ আছে!) এবং `results`-কে একসাথে গুছিয়ে ক্লায়েন্টকে রিটার্ন করে।
+
+<br>
 <br>
 
 ---
